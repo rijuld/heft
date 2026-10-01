@@ -36,7 +36,7 @@ a terminal. Here is what would make it a tool agents *need*:
 | **Diff mode** (on roadmap) | "What did this agent's PR add to the build, and how much is used?" is exactly the review question. | `heft -base origin/main`, which weighs both and prints only the deltas. |
 | **Inline extraction** | The `✂ inline` note says "consider copying them". An agent can't reliably find the reachable *closure* (helpers, unexported types, consts) by reading. | `heft extract <module>`: emit the reachable closure as one Go file, with the module's LICENSE header. heft already has the reached set. |
 | **License per module** (on roadmap) | Gates whether inlining is allowed at all. | Detect `LICENSE*` in the module dir and include an SPDX guess in `why` and the JSON. |
-| **Stable, versioned JSON** | Agents parse JSON. There's no `schema_version`, `Func.Pos` is `json:"-"`, and `Dep` flattens an embedded `*Module`, so any field rename silently breaks consumers. | Add `"schema_version": 1`, document the schema in the README, and add a golden-file test for `-json`. |
+| **Stable, versioned JSON** | Agents parse JSON. There's no `schema_version` and no golden test, so a field rename silently breaks consumers and nothing catches it. | Add `"schema_version": 1`, document the schema in the README, and add a golden-file test for `-json`. |
 | **Integrations** | Discovery. An agent won't run a tool it doesn't know exists. | A Claude Code hook example (`PostToolUse` on edits to `go.mod` → `heft -fail-on heavy`), a GitHub Action, and optionally a tiny MCP server wrapping `Analyze`/`why`. |
 | **Markdown output** (on roadmap) | PR comments are where agents and reviewers meet. | `-format md`. |
 | **Library mode** (on roadmap) | Most Go repos agents touch are libraries; heft currently exits 2 on them. | Roots = exported API (+ tests optionally). |
@@ -77,9 +77,10 @@ The same adjusted positions are used as keys for the `reached` map. That's consi
 on both sides, but it also means `File` in output points to `grammar.y`, which doesn't
 exist in the module.
 
-**Fix:** use `prog.Fset.PositionFor(pos, false)` (unadjusted) for line spans and
-reachability keys, in `Analyze` (where `Lines` is computed) and in `Entries`. Add a
-fixture module with a `//line` directive.
+**Fix:** compute line *spans* from unadjusted start and end positions
+(`prog.Fset.PositionFor(pos, false)`), and keep the adjusted position for the file
+name used in display and attribution (see §2.2 for why the adjusted name is the one
+to keep). Clamp to ≥ 1 as a backstop. Add a fixture module with a `//line` directive.
 
 ### 2.2 cgo glue is counted as the module's own code (verified, medium)
 
@@ -99,8 +100,15 @@ REMOVING IT WOULD DROP  1 module, 67 lines of Go   (the source file is 11 lines)
 This inflates both the function counts and the "drops N lines" figures for anything
 cgo-backed (sqlite drivers, etc.), which skews `heavy`/`inline`.
 
-**Fix:** skip declarations whose (unadjusted) file isn't in `p.GoFiles`, or whose name
-starts with `_Cfunc_`/`_cgo_`. Line counts should come from the original `GoFiles`.
+**Fix:** skip declarations whose **adjusted** file name isn't in `p.GoFiles`. cgo
+rewrites the user's own files into the build cache too, and maps them back with
+`//line` directives. Verified: `Rand`'s adjusted position is `cg.go:6`, but its
+unadjusted file is a hash-named cache file, while the glue's adjusted file is also a
+hash name. Filtering on the *unadjusted* name would therefore drop every function in
+a cgo package, including the user's. Count file lines from the original `GoFiles`.
+
+**§2.1 and §2.2 must be fixed together**, with one fixture that has both a cgo
+package and a `//line` directive.
 The README roadmap already mentions "cgo in a module's weight", and it can be counted
 separately and explicitly.
 
@@ -160,7 +168,8 @@ operation.
 4. **A parent `go.work` changes results.** Running `heft -C some/dir` inside a tree
    with a `go.work` silently uses the workspace. Consider `GOWORK=off` unless asked.
 5. **CI hygiene** (`.github/workflows/ci.yml`):
-   - Add `permissions: contents: read`; the default token is broader than this job needs.
+   - Set `permissions: contents: read` explicitly, so the job doesn't depend on the
+     repo or org default for `GITHUB_TOKEN`.
    - Pin `actions/checkout` and `actions/setup-go` to commit SHAs. A tool whose pitch
      is supply-chain caution should do it itself.
    - Add `govulncheck ./...` and a Windows runner (the output uses emoji and

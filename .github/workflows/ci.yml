@@ -16,6 +16,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # The oldest Go heft supports (latest patch), and the newest.
+        go: ["1.26.x"]
+        include:
+          - os: ubuntu-latest
+            go: stable
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -26,7 +32,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
@@ -45,5 +51,6 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          # Scan with the Go a fresh install gets: patched standard library.
+          go-version: stable
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

@@ -79,7 +79,10 @@ func Try(module string, use []string, opt Options) (*TryResult, error) {
 		}
 	}
 	if dir, ok := strings.CutPrefix(query, "dir:"); ok {
-		if err := gocmd("mod", "edit", "-require="+modPath+"@v0.0.0", "-replace="+modPath+"="+dir); err != nil {
+		if err := gocmd("mod", "edit", "-replace="+modPath+"="+dir); err != nil {
+			return nil, err
+		}
+		if err := gocmd("get", modPath+"@v0.0.0"); err != nil {
 			return nil, err
 		}
 	} else if err := gocmd("get", query); err != nil {

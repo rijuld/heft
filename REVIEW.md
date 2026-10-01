@@ -7,6 +7,45 @@ funcs · 16k lines (66%) · ✓ earns its keep`).
 Every finding marked **verified** below has a repro that was run. **Unverified** means
 it was reasoned from the code but not exercised.
 
+## Status
+
+Addressed on the `fix/review-findings` branch. Every fix has a test that fails
+without it; CI passes on Linux, macOS and Windows, plus govulncheck.
+
+| § | Item | Status |
+| --- | --- | --- |
+| 1 | `heft try` (pre-adoption check) | ✅ Fixed. Generates real zero-value calls, because RTA doesn't count functions only taken as values (verified). Never edits go.mod/go.sum (tested). |
+| 1 | Diff mode | ✅ Fixed: `heft -base <ref>`, via `git archive`; `-fail-on` then gates only new/changed deps |
+| 1 | Inline extraction | ✅ Fixed: `heft extract`. Tested to `go build` for three fixtures; Glow's `editor` builds too. |
+| 1 | License per module | ✅ Fixed: SPDX guess in `why`, JSON and Markdown, and in the `inline` note |
+| 1 | Versioned JSON | ✅ Fixed: `schema_version` + golden tests |
+| 1 | Integrations | ✅ Fixed: `heft mcp`, a Claude Code hook (tested end to end), a composite GitHub Action |
+| 1 | Markdown output | ✅ Fixed: `-format md` |
+| 1 | Library mode | ⏸ Deferred (roadmap) |
+| 2.1 | `//line` negative counts | ✅ Fixed |
+| 2.2 | cgo glue counted | ✅ Fixed. Glue is filtered only in packages cgo rewrote, so goyacc-style code keeps its functions. |
+| 2.3 | Flags after packages | ✅ Fixed (`--` ends flags) |
+| 2.3 | `-fail-on` single value | ✅ Fixed: list, names every offender, plus `-allow` |
+| 2.3 | `why ""` | ✅ Fixed (exit 2) |
+| 2.3 | `writeJSON` stderr | ✅ Fixed |
+| 2.3 | Test message | ✅ Fixed |
+| 2.3 | Func literals in `var` | ✅ Verified (reported as "types/consts only"), then fixed |
+| 2.3 | `go.work` | ✅ Verified (reported "no third-party modules"), then fixed: your code = modules of the weighed programs |
+| 3.1 | Toolchain downloads | ✅ Fixed: `GOTOOLCHAIN=local` by default, `-toolchain=auto` to opt out |
+| 3.2 | Module downloads | ✅ `-offline`. `-mod=readonly` is already the go command's default, and forcing it would break vendoring. |
+| 3.3 | cgo runs the C toolchain | ✅ `-cgo=false` |
+| 3.4 | Parent `go.work` | ✅ Documented in SECURITY.md (`GOWORK=off`); honoured by default, like `go build` |
+| 3.5 | CI hygiene | ✅ Fixed: explicit `permissions`, SHA-pinned actions, no persisted credentials, Windows, govulncheck. govulncheck found stdlib vulnerabilities reachable from heft under Go 1.26.0, so CI and releases now use patched Go. |
+| 3.6 | Distribution | ✅ GoReleaser + provenance workflow, run on tag push. README no longer recommends `@latest` in CI. **No tag has been pushed yet.** |
+| 3.7 | SECURITY.md | ✅ Added |
+| 4 | Memory | 📝 Documented. Reducing it is deferred. |
+| 4 | Progress / `-v` | ✅ Fixed |
+| 4 | `-sort` | ✅ Fixed |
+| 4 | `-version` | ✅ Fixed |
+| 4 | Exit codes | ✅ Documented in `-h` and README |
+| 4 | Configurable thresholds | ⏸ Deferred (roadmap); `-allow` covers the CI need |
+| 4 | Allowlisting | ✅ `-allow` |
+
 ---
 
 ## 1. Why heft is worth existing in an agent world (and what's missing for it)

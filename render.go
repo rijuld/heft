@@ -160,6 +160,8 @@ func renderWhy(w io.Writer, p painter, r *weigh.Report, m *weigh.Module) {
 	}
 	tw.Flush()
 
+	fmt.Fprintf(w, "\n   %s %s\n", p.bold("LICENSE"), licenseLabel(m))
+
 	if d := r.Dep(m); d != nil {
 		fmt.Fprintf(w, "\n   %s\n", p.bold("REMOVING IT WOULD DROP"))
 		fmt.Fprintf(w, "     %d module%s, %s lines of Go: %s\n", len(d.Drops), plural(len(d.Drops)), weigh.Human(d.DropLines), strings.Join(d.Drops, ", "))
@@ -169,14 +171,15 @@ func renderWhy(w io.Writer, p painter, r *weigh.Report, m *weigh.Module) {
 }
 
 type whyOut struct {
-	Module    *weigh.Module `json:"module"`
-	Dep       *weigh.Dep    `json:"dependency,omitempty"`
-	Entries   []weigh.Entry `json:"entries"`
-	Functions []*weigh.Func `json:"functions"`
+	SchemaVersion int           `json:"schema_version"`
+	Module        *weigh.Module `json:"module"`
+	Dep           *weigh.Dep    `json:"dependency,omitempty"`
+	Entries       []weigh.Entry `json:"entries"`
+	Functions     []*weigh.Func `json:"functions"`
 }
 
 func whyJSON(r *weigh.Report, m *weigh.Module) whyOut {
-	return whyOut{Module: m, Dep: r.Dep(m), Entries: r.Entries(m), Functions: m.Functions()}
+	return whyOut{SchemaVersion: weigh.SchemaVersion, Module: m, Dep: r.Dep(m), Entries: r.Entries(m), Functions: m.Functions()}
 }
 
 func plural(n int) string {
@@ -184,4 +187,91 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+func licenseLabel(m *weigh.Module) string {
+	switch m.License {
+	case "":
+		return "none found"
+	case "unknown":
+		return "unrecognised (" + filepath.Base(m.LicenseFile) + ")"
+	default:
+		return m.License + " (" + filepath.Base(m.LicenseFile) + ")"
+	}
+}
+
+// mdEscape keeps text from breaking a Markdown table cell.
+func mdEscape(s string) string {
+	return strings.NewReplacer("|", "\\|", "\n", " ").Replace(s)
+}
+
+// renderMarkdown writes the report for a PR comment or a job summary.
+func renderMarkdown(w io.Writer, r *weigh.Report, all bool) {
+	fmt.Fprintf(w, "### ⚖️ heft: `%s`\n\n", r.MainModule)
+	if len(r.Modules) == 0 {
+		fmt.Fprintln(w, "No third-party modules. Nothing to weigh. 🪶")
+		return
+	}
+	fmt.Fprintf(w, "%s lines of third-party Go across %d module%s; %s of %s lines inside functions are reachable from `main` (%s).\n\n",
+		weigh.Human(r.ThirdParty), len(r.Modules), plural(len(r.Modules)), weigh.Human(r.ThirdReached), weigh.Human(r.ThirdFuncLines), pct(r.ThirdReached, r.ThirdFuncLines))
+	fmt.Fprintln(w, "| Direct dependency | You call | You reach | Removing it drops | License | Verdict |")
+	fmt.Fprintln(w, "| --- | --- | --- | --- | --- | --- |")
+	for _, d := range r.Direct {
+		st := verdictStyle[d.Verdict]
+		fmt.Fprintf(w, "| `%s` %s | %d of %d funcs | %s line%s (%s) | %d module%s · %s lines | %s | %s %s |\n",
+			d.Path, d.Version, d.ReachedFuncs, d.Funcs, weigh.Human(d.ReachedLines), plural(d.ReachedLines), pct(d.ReachedLines, d.FuncLines),
+			len(d.Drops), plural(len(d.Drops)), weigh.Human(d.DropLines), mdEscape(licenseOrDash(d.License)), st.icon, st.label)
+	}
+	var notes []string
+	for _, d := range r.Direct {
+		if d.Verdict == weigh.VerdictKeep || d.Verdict == weigh.VerdictLight || d.Verdict == weigh.VerdictShared {
+			continue
+		}
+		n := fmt.Sprintf("- %s **`%s`**: %s", verdictStyle[d.Verdict].icon, d.Path, mdEscape(d.Note))
+		if len(d.Drops) > 1 {
+			n += fmt.Sprintf(" (drops with it: %s)", strings.Join(d.Drops[1:], ", "))
+		}
+		notes = append(notes, n)
+	}
+	if len(notes) > 0 {
+		fmt.Fprintf(w, "\n%s\n", strings.Join(notes, "\n"))
+	}
+	if all {
+		fmt.Fprint(w, "\n<details><summary>All modules</summary>\n\n")
+		fmt.Fprintln(w, "| Module | Kind | Packages | Lines | Funcs reached |")
+		fmt.Fprintln(w, "| --- | --- | --- | --- | --- |")
+		for _, m := range r.Modules {
+			kind := "indirect"
+			if m.Direct {
+				kind = "direct"
+			}
+			fmt.Fprintf(w, "| `%s` | %s | %d | %s | %d of %d |\n", modLabel(m), kind, m.Packages, weigh.Human(m.Lines), m.ReachedFuncs, m.Funcs)
+		}
+		fmt.Fprintln(w, "\n</details>")
+	}
+	fmt.Fprintln(w, "\n<sub>Reachability is RTA from `main`: static and conservative. `heft why <module>` shows the call sites.</sub>")
+}
+
+func renderWhyMarkdown(w io.Writer, r *weigh.Report, m *weigh.Module) {
+	fmt.Fprintf(w, "### ⚖️ `%s`\n\n", modLabel(m))
+	fmt.Fprintf(w, "You reach **%d of %d functions** · %s of %s function lines (%s) · license: %s\n\n",
+		m.ReachedFuncs, m.Funcs, weigh.Human(m.ReachedLines), weigh.Human(m.FuncLines), pct(m.ReachedLines, m.FuncLines), mdEscape(licenseLabel(m)))
+	if entries := r.Entries(m); len(entries) > 0 {
+		fmt.Fprintln(w, "| Called | From | At |")
+		fmt.Fprintln(w, "| --- | --- | --- |")
+		for _, e := range entries {
+			fmt.Fprintf(w, "| `%s` | `%s` | %s:%d |\n", e.Callee, e.Caller, filepath.Base(e.File), e.Line)
+		}
+		fmt.Fprintln(w)
+	}
+	if d := r.Dep(m); d != nil {
+		fmt.Fprintf(w, "%s **%s**: %s\n", verdictStyle[d.Verdict].icon, verdictStyle[d.Verdict].label, mdEscape(d.Note))
+	}
+}
+
+func licenseOrDash(spdx string) string {
+	if spdx == "" {
+		return "–"
+	}
+	return spdx
 }

@@ -17,6 +17,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/rta"
@@ -36,6 +37,15 @@ type Options struct {
 	AutoToolchain bool // allow GOTOOLCHAIN downloads (default: GOTOOLCHAIN=local)
 	Offline       bool // GOPROXY=off: never download modules
 	NoCgo         bool // CGO_ENABLED=0: never run the C toolchain
+
+	// Log, if set, receives progress messages (one line each, no newline).
+	Log func(format string, args ...any)
+}
+
+func (opt Options) logf(format string, args ...any) {
+	if opt.Log != nil {
+		opt.Log(format, args...)
+	}
 }
 
 // Env returns the environment heft runs the go command with.
@@ -74,6 +84,10 @@ type Module struct {
 	Version string `json:"version,omitempty"`
 	Replace string `json:"replace,omitempty"`
 	Direct  bool   `json:"direct"`
+	// License is an SPDX identifier guessed from the module's license file:
+	// "" when there is none, "unknown" when it isn't recognised.
+	License     string `json:"license"`
+	LicenseFile string `json:"license_file,omitempty"`
 
 	Packages     int `json:"packages"`      // packages compiled into the program
 	Lines        int `json:"lines"`         // source lines in those packages
@@ -110,8 +124,13 @@ type Entry struct {
 	Line   int    `json:"line"`
 }
 
+// SchemaVersion is bumped whenever a JSON field is renamed, removed or
+// changes meaning. Adding fields doesn't bump it.
+const SchemaVersion = 1
+
 // Report is the result of weighing one program (or several main packages).
 type Report struct {
+	SchemaVersion  int       `json:"schema_version"`
 	MainModule     string    `json:"main_module"`
 	Programs       []string  `json:"programs"`
 	ThirdParty     int       `json:"third_party_lines"`
@@ -121,6 +140,7 @@ type Report struct {
 	Direct         []*Dep    `json:"direct"`
 
 	byPath  map[string]*Module
+	pkgs    map[string]*packages.Package
 	graph   *callgraph.Graph
 	fset    *token.FileSet
 	ownerOf func(*ssa.Function) (*Module, string)
@@ -157,6 +177,7 @@ func Analyze(opt Options) (*Report, error) {
 	if opt.Tags != "" {
 		cfg.BuildFlags = []string{"-tags=" + opt.Tags}
 	}
+	start := time.Now()
 	initial, err := packages.Load(cfg, patterns...)
 	if err != nil {
 		return nil, explain(err)
@@ -174,8 +195,11 @@ func Analyze(opt Options) (*Report, error) {
 		return nil, explain(fmt.Errorf("packages have errors:\n  %s", strings.Join(loadErrs, "\n  ")))
 	}
 
+	opt.logf("loaded %d packages in %s", countPackages(initial), since(&start))
+
 	prog, ssaPkgs := ssautil.AllPackages(initial, ssa.InstantiateGenerics)
 	prog.Build()
+	opt.logf("built SSA in %s", since(&start))
 
 	var roots []*ssa.Function
 	var mainPkgs []*packages.Package
@@ -191,6 +215,7 @@ func Analyze(opt Options) (*Report, error) {
 
 	res := rta.Analyze(roots, true)
 	res.CallGraph.DeleteSyntheticNodes()
+	opt.logf("RTA: %d reachable functions in %s", len(res.Reachable), since(&start))
 
 	// Reachability by position: generic instances and wrappers collapse
 	// onto the declaration they came from.
@@ -201,7 +226,7 @@ func Analyze(opt Options) (*Report, error) {
 		}
 	}
 
-	r := &Report{byPath: map[string]*Module{}, graph: res.CallGraph, fset: prog.Fset}
+	r := &Report{SchemaVersion: SchemaVersion, byPath: map[string]*Module{}, graph: res.CallGraph, fset: prog.Fset}
 	// Your code is the modules holding the programs being weighed. In a go.work
 	// workspace every module reports Main, but a sibling library the program
 	// imports is still a dependency.
@@ -235,6 +260,11 @@ func Analyze(opt Options) (*Report, error) {
 					mod.Replace += "@" + m.Replace.Version
 				}
 			}
+			dir := m.Dir
+			if dir == "" && m.Replace != nil {
+				dir = m.Replace.Dir
+			}
+			mod.License, mod.LicenseFile = License(dir)
 			r.byPath[m.Path] = mod
 			r.Modules = append(r.Modules, mod)
 		}
@@ -387,6 +417,9 @@ func Analyze(opt Options) (*Report, error) {
 		return r.Direct[i].Path < r.Direct[j].Path
 	})
 
+	r.pkgs = all
+	opt.logf("weighed %d modules in %s", len(r.Modules), since(&start))
+
 	r.ownerOf = func(fn *ssa.Function) (*Module, string) {
 		for fn.Parent() != nil {
 			fn = fn.Parent()
@@ -400,6 +433,20 @@ func Analyze(opt Options) (*Report, error) {
 		return pkgModule[fn.Pkg.Pkg.Path()], fn.Pkg.Pkg.Path()
 	}
 	return r, nil
+}
+
+func countPackages(initial []*packages.Package) int {
+	n := 0
+	packages.Visit(initial, nil, func(*packages.Package) { n++ })
+	return n
+}
+
+// since returns the time since *t and resets it, for per-phase timings.
+func since(t *time.Time) time.Duration {
+	now := time.Now()
+	d := now.Sub(*t).Round(time.Millisecond)
+	*t = now
+	return d
 }
 
 // explain adds the way out to errors caused by heft's safe defaults.
@@ -500,7 +547,7 @@ func verdict(d *Dep) (string, string) {
 	case len(d.Drops) == 0:
 		return VerdictShared, "other dependencies import it too, so dropping your import frees nothing"
 	case d.ReachedFuncs <= inlineMaxFuncs && d.ReachedLines <= inlineMaxLines && len(d.Drops) == 1:
-		return VerdictInline, fmt.Sprintf("you use %d line%s of it; consider copying them (keep the license)", d.ReachedLines, plural(d.ReachedLines))
+		return VerdictInline, fmt.Sprintf("you use %d line%s of it; consider copying them %s", d.ReachedLines, plural(d.ReachedLines), copyTerms(d.License))
 	case (len(d.Drops) >= heavyMinModules || d.DropLines >= heavyMinLines) && percent(d.DropReachedLines, d.DropFuncLines) < heavyMaxUsePct:
 		return VerdictHeavy, fmt.Sprintf("brings %d modules / %s lines; you reach %s of their %s function lines (%.0f%%)",
 			len(d.Drops), Human(d.DropLines), Human(d.DropReachedLines), Human(d.DropFuncLines), percent(d.DropReachedLines, d.DropFuncLines))
@@ -508,6 +555,20 @@ func verdict(d *Dep) (string, string) {
 		return VerdictLight, fmt.Sprintf("you reach %.0f%% of its code", pct)
 	default:
 		return VerdictKeep, fmt.Sprintf("you reach %.0f%% of its code", pct)
+	}
+}
+
+// copyTerms says what copying code under a license asks of you.
+func copyTerms(spdx string) string {
+	switch {
+	case spdx == "":
+		return "(no license file found: check you may copy it)"
+	case permissive(spdx):
+		return "(keep its " + spdx + " notice)"
+	case spdx == "unknown":
+		return "(check its license first)"
+	default:
+		return "(" + spdx + ": check what copying obliges you to)"
 	}
 }
 

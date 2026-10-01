@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "module": {
+    "path": "example.com/big",
+    "version": "v0.0.0",
+    "replace": "../big",
+    "direct": true,
+    "license": "Apache-2.0",
+    "license_file": "$TESTDATA/big/LICENSE",
+    "packages": 2,
+    "lines": 39,
+    "funcs": 8,
+    "reached_funcs": 2,
+    "func_lines": 19,
+    "reached_lines": 4,
+    "init_funcs": 0
+  },
+  "dependency": {
+    "path": "example.com/big",
+    "version": "v0.0.0",
+    "replace": "../big",
+    "direct": true,
+    "license": "Apache-2.0",
+    "license_file": "$TESTDATA/big/LICENSE",
+    "packages": 2,
+    "lines": 39,
+    "funcs": 8,
+    "reached_funcs": 2,
+    "func_lines": 19,
+    "reached_lines": 4,
+    "init_funcs": 0,
+    "drops": [
+      "example.com/big",
+      "example.com/deep1",
+      "example.com/deep2",
+      "example.com/huge"
+    ],
+    "drop_lines": 62,
+    "drop_func_lines": 27,
+    "drop_reached_lines": 5,
+    "verdict": "heavy",
+    "note": "brings 4 modules / 62 lines; you reach 5 of their 27 function lines (19%)"
+  },
+  "entries": [
+    {
+      "callee": "big.Greet",
+      "caller": "main.main",
+      "file": "$TESTDATA/app/main.go",
+      "line": 21
+    }
+  ],
+  "functions": [
+    {
+      "name": "Greet",
+      "package": "example.com/big",
+      "file": "$TESTDATA/big/big.go",
+      "line": 11,
+      "lines": 3,
+      "reached": true
+    },
+    {
+      "name": "Render",
+      "package": "example.com/big/internal/engine",
+      "file": "$TESTDATA/big/internal/engine/engine.go",
+      "line": 6,
+      "lines": 1,
+      "reached": true
+    },
+    {
+      "name": "Listen",
+      "package": "example.com/big/internal/engine",
+      "file": "$TESTDATA/big/internal/engine/engine.go",
+      "line": 8,
+      "lines": 6,
+      "reached": false
+    },
+    {
+      "name": "Apply",
+      "package": "example.com/big/internal/engine",
+      "file": "$TESTDATA/big/internal/engine/engine.go",
+      "line": 15,
+      "lines": 5,
+      "reached": false
+    },
+    {
+      "name": "Configure",
+      "package": "example.com/big",
+      "file": "$TESTDATA/big/big.go",
+      "line": 17,
+      "lines": 1,
+      "reached": false
+    },
+    {
+      "name": "Serve",
+      "package": "example.com/big",
+      "file": "$TESTDATA/big/big.go",
+      "line": 16,
+      "lines": 1,
+      "reached": false
+    },
+    {
+      "name": "Shutdown",
+      "package": "example.com/big",
+      "file": "$TESTDATA/big/big.go",
+      "line": 18,
+      "lines": 1,
+      "reached": false
+    },
+    {
+      "name": "Stop",
+      "package": "example.com/big/internal/engine",
+      "file": "$TESTDATA/big/internal/engine/engine.go",
+      "line": 21,
+      "lines": 1,
+      "reached": false
+    }
+  ]
+}

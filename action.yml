@@ -1,0 +1,35 @@
+name: heft
+description: Weigh a Go program's dependencies against what it uses, and stop new heavyweights at the door.
+branding:
+  icon: anchor
+  color: blue
+
+inputs:
+  version:
+    description: heft version to install (a release tag such as v0.1.0, or a commit). Pin it.
+    required: true
+  args:
+    description: "Arguments for heft, e.g. `-fail-on heavy ./cmd/app`, or `-base origin/main -fail-on heavy,inline`."
+    default: ""
+  working-directory:
+    description: Directory of the Go module.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Install heft
+      shell: bash
+      env:
+        HEFT_VERSION: ${{ inputs.version }}
+      run: go install "github.com/rijuld/heft@${HEFT_VERSION}"
+    - name: Run heft
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HEFT_ARGS: ${{ inputs.args }}
+      # The Markdown report goes to the job summary; the exit code is heft's.
+      run: |
+        set -o pipefail
+        # shellcheck disable=SC2086 # HEFT_ARGS is a list of arguments
+        heft -format md $HEFT_ARGS | tee -a "$GITHUB_STEP_SUMMARY"

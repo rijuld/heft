@@ -8,13 +8,16 @@
 package weigh
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/rta"
@@ -28,6 +31,39 @@ type Options struct {
 	Dir      string   // working directory (default: current)
 	Patterns []string // package patterns (default: ./...)
 	Tags     string   // comma-separated build tags
+
+	// heft is often pointed at code you don't control, so by default the go
+	// command may not switch to the toolchain the target's go.mod asks for.
+	AutoToolchain bool // allow GOTOOLCHAIN downloads (default: GOTOOLCHAIN=local)
+	Offline       bool // GOPROXY=off: never download modules
+	NoCgo         bool // CGO_ENABLED=0: never run the C toolchain
+
+	// Log, if set, receives progress messages (one line each, no newline).
+	Log func(format string, args ...any)
+}
+
+func (opt Options) logf(format string, args ...any) {
+	if opt.Log != nil {
+		opt.Log(format, args...)
+	}
+}
+
+// Env returns the environment heft runs the go command with.
+func (opt Options) Env() []string {
+	env := os.Environ()
+	if !opt.AutoToolchain && os.Getenv("GOTOOLCHAIN") == "" {
+		env = append(env, "GOTOOLCHAIN=local")
+	}
+	if opt.AutoToolchain {
+		env = append(env, "GOTOOLCHAIN=auto")
+	}
+	if opt.Offline {
+		env = append(env, "GOPROXY=off")
+	}
+	if opt.NoCgo {
+		env = append(env, "CGO_ENABLED=0")
+	}
+	return env
 }
 
 // Func is one source-level function or method declaration.
@@ -48,6 +84,10 @@ type Module struct {
 	Version string `json:"version,omitempty"`
 	Replace string `json:"replace,omitempty"`
 	Direct  bool   `json:"direct"`
+	// License is an SPDX identifier guessed from the module's license file:
+	// "" when there is none, "unknown" when it isn't recognised.
+	License     string `json:"license"`
+	LicenseFile string `json:"license_file,omitempty"`
 
 	Packages     int `json:"packages"`      // packages compiled into the program
 	Lines        int `json:"lines"`         // source lines in those packages
@@ -84,8 +124,13 @@ type Entry struct {
 	Line   int    `json:"line"`
 }
 
+// SchemaVersion is bumped whenever a JSON field is renamed, removed or
+// changes meaning. Adding fields doesn't bump it.
+const SchemaVersion = 1
+
 // Report is the result of weighing one program (or several main packages).
 type Report struct {
+	SchemaVersion  int       `json:"schema_version"`
 	MainModule     string    `json:"main_module"`
 	Programs       []string  `json:"programs"`
 	ThirdParty     int       `json:"third_party_lines"`
@@ -95,6 +140,7 @@ type Report struct {
 	Direct         []*Dep    `json:"direct"`
 
 	byPath  map[string]*Module
+	pkgs    map[string]*packages.Package
 	graph   *callgraph.Graph
 	fset    *token.FileSet
 	ownerOf func(*ssa.Function) (*Module, string)
@@ -126,13 +172,15 @@ func Analyze(opt Options) (*Report, error) {
 	cfg := &packages.Config{
 		Mode: packages.LoadAllSyntax | packages.NeedModule,
 		Dir:  opt.Dir,
+		Env:  opt.Env(),
 	}
 	if opt.Tags != "" {
 		cfg.BuildFlags = []string{"-tags=" + opt.Tags}
 	}
+	start := time.Now()
 	initial, err := packages.Load(cfg, patterns...)
 	if err != nil {
-		return nil, err
+		return nil, explain(err)
 	}
 	var loadErrs []string
 	packages.Visit(initial, nil, func(p *packages.Package) {
@@ -144,11 +192,14 @@ func Analyze(opt Options) (*Report, error) {
 		if len(loadErrs) > 10 {
 			loadErrs = append(loadErrs[:10], fmt.Sprintf("... and %d more", len(loadErrs)-10))
 		}
-		return nil, fmt.Errorf("packages have errors:\n  %s", strings.Join(loadErrs, "\n  "))
+		return nil, explain(fmt.Errorf("packages have errors:\n  %s", strings.Join(loadErrs, "\n  ")))
 	}
+
+	opt.logf("loaded %d packages in %s", countPackages(initial), since(&start))
 
 	prog, ssaPkgs := ssautil.AllPackages(initial, ssa.InstantiateGenerics)
 	prog.Build()
+	opt.logf("built SSA in %s", since(&start))
 
 	var roots []*ssa.Function
 	var mainPkgs []*packages.Package
@@ -164,6 +215,7 @@ func Analyze(opt Options) (*Report, error) {
 
 	res := rta.Analyze(roots, true)
 	res.CallGraph.DeleteSyntheticNodes()
+	opt.logf("RTA: %d reachable functions in %s", len(res.Reachable), since(&start))
 
 	// Reachability by position: generic instances and wrappers collapse
 	// onto the declaration they came from.
@@ -174,20 +226,29 @@ func Analyze(opt Options) (*Report, error) {
 		}
 	}
 
-	r := &Report{byPath: map[string]*Module{}, graph: res.CallGraph, fset: prog.Fset}
+	r := &Report{SchemaVersion: SchemaVersion, byPath: map[string]*Module{}, graph: res.CallGraph, fset: prog.Fset}
+	// Your code is the modules holding the programs being weighed. In a go.work
+	// workspace every module reports Main, but a sibling library the program
+	// imports is still a dependency.
+	own := map[string]bool{}
 	for _, p := range mainPkgs {
 		r.Programs = append(r.Programs, p.PkgPath)
 		if p.Module != nil {
-			r.MainModule = p.Module.Path
+			own[p.Module.Path] = true
+			if r.MainModule == "" {
+				r.MainModule = p.Module.Path
+			}
 		}
 	}
+	isOwn := func(p *packages.Package) bool { return p.Module != nil && own[p.Module.Path] }
 
 	all := map[string]*packages.Package{}
-	pkgModule := map[string]*Module{} // package path → module (nil for std / main)
+	pkgModule := map[string]*Module{} // package path → module (nil for std / yours)
+	pkgLines := map[string]int{}      // package path → source lines
 	packages.Visit(mainPkgs, nil, func(p *packages.Package) {
 		all[p.PkgPath] = p
 		m := p.Module
-		if m == nil || m.Main {
+		if m == nil || own[m.Path] {
 			return
 		}
 		mod := r.byPath[m.Path]
@@ -199,43 +260,77 @@ func Analyze(opt Options) (*Report, error) {
 					mod.Replace += "@" + m.Replace.Version
 				}
 			}
+			dir := m.Dir
+			if dir == "" && m.Replace != nil {
+				dir = m.Replace.Dir
+			}
+			mod.License, mod.LicenseFile = License(dir)
 			r.byPath[m.Path] = mod
 			r.Modules = append(r.Modules, mod)
 		}
 		pkgModule[p.PkgPath] = mod
+		pkgLines[p.PkgPath] = sourceLines(prog.Fset, p)
 		mod.Packages++
+		mod.Lines += pkgLines[p.PkgPath]
 		mod.packages = append(mod.packages, p.PkgPath)
+		add := func(fn *Func) {
+			fn.File, fn.Line = fn.Pos.Filename, fn.Pos.Line
+			mod.functions = append(mod.functions, fn)
+			if fn.Init {
+				mod.InitFuncs++
+				return
+			}
+			mod.Funcs++
+			mod.FuncLines += fn.Lines
+			if fn.Reached {
+				mod.ReachedFuncs++
+				mod.ReachedLines += fn.Lines
+			}
+		}
+		userFile := userFiles(p)
 		for _, f := range p.Syntax {
-			mod.Lines += prog.Fset.File(f.Pos()).LineCount()
 			for _, decl := range f.Decls {
-				fd, ok := decl.(*ast.FuncDecl)
-				if !ok {
-					continue
+				if userFile != nil && !userFile[prog.Fset.Position(decl.Pos()).Filename] {
+					continue // cgo glue, generated by the go command
 				}
-				fn := &Func{
-					Name:    funcName(fd),
-					Package: p.PkgPath,
-					Pos:     prog.Fset.Position(fd.Name.Pos()),
-					Lines:   prog.Fset.Position(fd.End()).Line - prog.Fset.Position(fd.Pos()).Line + 1,
-					Init:    fd.Recv == nil && fd.Name.Name == "init",
-				}
-				fn.File, fn.Line = fn.Pos.Filename, fn.Pos.Line
-				fn.Reached = fn.Init || reached[fn.Pos]
-				if obj, ok := p.TypesInfo.Defs[fd.Name].(*types.Func); ok && !fn.Reached {
-					if v := prog.FuncValue(obj); v != nil && v.Pos().IsValid() {
-						fn.Reached = reached[prog.Fset.Position(v.Pos())]
+				switch decl := decl.(type) {
+				case *ast.FuncDecl:
+					fn := &Func{
+						Name:    funcName(decl),
+						Package: p.PkgPath,
+						Pos:     prog.Fset.Position(decl.Name.Pos()),
+						Lines:   span(prog.Fset, decl.Pos(), decl.End()),
+						Init:    decl.Recv == nil && decl.Name.Name == "init",
 					}
-				}
-				mod.functions = append(mod.functions, fn)
-				if fn.Init {
-					mod.InitFuncs++
-					continue
-				}
-				mod.Funcs++
-				mod.FuncLines += fn.Lines
-				if fn.Reached {
-					mod.ReachedFuncs++
-					mod.ReachedLines += fn.Lines
+					fn.Reached = fn.Init || reached[fn.Pos]
+					if obj, ok := p.TypesInfo.Defs[decl.Name].(*types.Func); ok && !fn.Reached {
+						if v := prog.FuncValue(obj); v != nil && v.Pos().IsValid() {
+							fn.Reached = reached[prog.Fset.Position(v.Pos())]
+						}
+					}
+					add(fn)
+				case *ast.GenDecl:
+					// var F = func(...) {...}: the literal is the function.
+					for _, spec := range decl.Specs {
+						vs, ok := spec.(*ast.ValueSpec)
+						if !ok || len(vs.Names) != len(vs.Values) {
+							continue
+						}
+						for i, v := range vs.Values {
+							lit, ok := v.(*ast.FuncLit)
+							if !ok {
+								continue
+							}
+							pos := prog.Fset.Position(lit.Pos())
+							add(&Func{
+								Name:    vs.Names[i].Name,
+								Package: p.PkgPath,
+								Pos:     pos,
+								Lines:   span(prog.Fset, lit.Pos(), lit.End()),
+								Reached: reached[pos],
+							})
+						}
+					}
 				}
 			}
 		}
@@ -247,9 +342,9 @@ func Analyze(opt Options) (*Report, error) {
 		r.ThirdReached += m.ReachedLines
 	}
 
-	// Direct dependencies: modules imported by the main module's own packages.
+	// Direct dependencies: modules imported by your own packages.
 	for _, p := range all {
-		if p.Module == nil || !p.Module.Main {
+		if !isOwn(p) {
 			continue
 		}
 		for _, imp := range p.Imports {
@@ -263,14 +358,13 @@ func Analyze(opt Options) (*Report, error) {
 	// Walk the package import graph from the main packages, cutting only the
 	// edges from the main module into that dependency; other dependencies may
 	// still need it.
-	isMain := func(p *packages.Package) bool { return p.Module != nil && p.Module.Main }
 	full := reach(mainPkgs, func(_, _ *packages.Package) bool { return true })
 	for _, m := range r.Modules {
 		if !m.Direct {
 			continue
 		}
 		kept := reach(mainPkgs, func(from, to *packages.Package) bool {
-			return !isMain(from) || pkgModule[to.PkgPath] != m
+			return !isOwn(from) || pkgModule[to.PkgPath] != m
 		})
 		d := &Dep{Module: m}
 		keptModules := map[*Module]bool{}
@@ -288,9 +382,7 @@ func Analyze(opt Options) (*Report, error) {
 			if mod == nil {
 				continue // std or main
 			}
-			for _, f := range all[path].Syntax {
-				d.DropLines += prog.Fset.File(f.Pos()).LineCount()
-			}
+			d.DropLines += pkgLines[path]
 			for _, fn := range mod.functions {
 				if fn.Package != path || fn.Init {
 					continue
@@ -325,6 +417,9 @@ func Analyze(opt Options) (*Report, error) {
 		return r.Direct[i].Path < r.Direct[j].Path
 	})
 
+	r.pkgs = all
+	opt.logf("weighed %d modules in %s", len(r.Modules), since(&start))
+
 	r.ownerOf = func(fn *ssa.Function) (*Module, string) {
 		for fn.Parent() != nil {
 			fn = fn.Parent()
@@ -338,6 +433,75 @@ func Analyze(opt Options) (*Report, error) {
 		return pkgModule[fn.Pkg.Pkg.Path()], fn.Pkg.Pkg.Path()
 	}
 	return r, nil
+}
+
+func countPackages(initial []*packages.Package) int {
+	n := 0
+	packages.Visit(initial, nil, func(*packages.Package) { n++ })
+	return n
+}
+
+// since returns the time since *t and resets it, for per-phase timings.
+func since(t *time.Time) time.Duration {
+	now := time.Now()
+	d := now.Sub(*t).Round(time.Millisecond)
+	*t = now
+	return d
+}
+
+// explain adds the way out to errors caused by heft's safe defaults.
+func explain(err error) error {
+	if strings.Contains(err.Error(), "GOTOOLCHAIN=local") {
+		return fmt.Errorf("%w\n(heft does not download Go toolchains by default; install that Go version, or rerun with -toolchain=auto)", err)
+	}
+	return err
+}
+
+// span counts the source lines from start to end. //line directives (in
+// generated code, and in the files cgo rewrites) can point the two ends at
+// different files, or backwards; then the raw file lines are the truth.
+func span(fset *token.FileSet, start, end token.Pos) int {
+	a, b := fset.Position(start), fset.Position(end)
+	if a.Filename == b.Filename && b.Line >= a.Line {
+		return b.Line - a.Line + 1
+	}
+	return fset.PositionFor(end, false).Line - fset.PositionFor(start, false).Line + 1
+}
+
+// userFiles returns the package's own source files when cgo has rewritten
+// them, so the glue it generates can be told apart; nil otherwise.
+func userFiles(p *packages.Package) map[string]bool {
+	files := map[string]bool{}
+	for _, f := range p.GoFiles {
+		files[f] = true
+	}
+	for _, f := range p.CompiledGoFiles {
+		if !files[f] {
+			return files
+		}
+	}
+	return nil
+}
+
+// sourceLines counts the lines of the package's Go source. For cgo packages
+// the parsed files are the go command's rewrites, so read the originals.
+func sourceLines(fset *token.FileSet, p *packages.Package) int {
+	n := 0
+	if userFiles(p) == nil {
+		for _, f := range p.Syntax {
+			n += fset.File(f.Pos()).LineCount()
+		}
+		return n
+	}
+	for _, name := range p.GoFiles {
+		if b, err := os.ReadFile(name); err == nil {
+			n += bytes.Count(b, []byte("\n"))
+			if len(b) > 0 && b[len(b)-1] != '\n' {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // reach returns the packages reachable from roots through imports that
@@ -383,7 +547,7 @@ func verdict(d *Dep) (string, string) {
 	case len(d.Drops) == 0:
 		return VerdictShared, "other dependencies import it too, so dropping your import frees nothing"
 	case d.ReachedFuncs <= inlineMaxFuncs && d.ReachedLines <= inlineMaxLines && len(d.Drops) == 1:
-		return VerdictInline, fmt.Sprintf("you use %d line%s of it; consider copying them (keep the license)", d.ReachedLines, plural(d.ReachedLines))
+		return VerdictInline, fmt.Sprintf("you use %d line%s of it; consider copying them %s", d.ReachedLines, plural(d.ReachedLines), copyTerms(d.License))
 	case (len(d.Drops) >= heavyMinModules || d.DropLines >= heavyMinLines) && percent(d.DropReachedLines, d.DropFuncLines) < heavyMaxUsePct:
 		return VerdictHeavy, fmt.Sprintf("brings %d modules / %s lines; you reach %s of their %s function lines (%.0f%%)",
 			len(d.Drops), Human(d.DropLines), Human(d.DropReachedLines), Human(d.DropFuncLines), percent(d.DropReachedLines, d.DropFuncLines))
@@ -391,6 +555,20 @@ func verdict(d *Dep) (string, string) {
 		return VerdictLight, fmt.Sprintf("you reach %.0f%% of its code", pct)
 	default:
 		return VerdictKeep, fmt.Sprintf("you reach %.0f%% of its code", pct)
+	}
+}
+
+// copyTerms says what copying code under a license asks of you.
+func copyTerms(spdx string) string {
+	switch {
+	case spdx == "":
+		return "(no license file found: check you may copy it)"
+	case permissive(spdx):
+		return "(keep its " + spdx + " notice)"
+	case spdx == "unknown":
+		return "(check its license first)"
+	default:
+		return "(" + spdx + ": check what copying obliges you to)"
 	}
 }
 

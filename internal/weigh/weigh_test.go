@@ -2,7 +2,11 @@ package weigh
 
 import (
 	"errors"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -121,7 +125,7 @@ func TestIndirectModulesAreAttributed(t *testing.T) {
 		t.Fatalf("huge: direct=%v reached %d of %d, want indirect 1 of 5", huge.Direct, huge.ReachedFuncs, huge.Funcs)
 	}
 	if r.ThirdReached != 13 { // tiny 6 + big 4 + huge 1 + shared 1 + mega-tiny 1
-		t.Fatalf("third-party reached lines = %d, want 12", r.ThirdReached)
+		t.Fatalf("third-party reached lines = %d, want 13", r.ThirdReached)
 	}
 }
 
@@ -169,5 +173,90 @@ func TestHuman(t *testing.T) {
 		if got := Human(n); got != want {
 			t.Errorf("Human(%d) = %q, want %q", n, got, want)
 		}
+	}
+}
+
+// Generated code's //line directives must not bend line counts, and
+// package-level function literals are functions too.
+func TestLineDirectivesAndFuncLiterals(t *testing.T) {
+	r, err := Analyze(Options{Dir: "testdata/edgeapp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen := dep(t, r, "example.com/gen")
+	if gen.Funcs != 2 || gen.ReachedFuncs != 1 || gen.ReachedLines != 10 || gen.FuncLines != 11 {
+		t.Fatalf("gen: reached %d of %d funcs, %d of %d lines; want Big (10 lines) of 2 funcs, 11 lines",
+			gen.ReachedFuncs, gen.Funcs, gen.ReachedLines, gen.FuncLines)
+	}
+	lit := dep(t, r, "example.com/lit")
+	if lit.Funcs != 2 || lit.ReachedFuncs != 1 || lit.ReachedLines != 3 {
+		t.Fatalf("lit: reached %d of %d funcs, %d lines; want Double (3 lines) of 2", lit.ReachedFuncs, lit.Funcs, lit.ReachedLines)
+	}
+	if lit.Verdict == VerdictNoCalls {
+		t.Fatalf("lit is called through a func literal, not types-only: %s", lit.Note)
+	}
+}
+
+// cgo rewrites a package's files; only the code its author wrote counts.
+func TestCgoGlueIsNotTheModule(t *testing.T) {
+	if out, err := exec.Command("go", "env", "CGO_ENABLED").Output(); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Skip("cgo unavailable")
+	}
+	r, err := Analyze(Options{Dir: "testdata/cgoapp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cg := dep(t, r, "example.com/cg")
+	if cg.Funcs != 1 || cg.ReachedLines != 6 || cg.Lines != 12 || cg.DropLines != 12 {
+		t.Fatalf("cg: %d funcs, %d reached lines, %d lines, drops %d; want 1, 6, 12, 12", cg.Funcs, cg.ReachedLines, cg.Lines, cg.DropLines)
+	}
+	for _, f := range cg.Functions() {
+		if filepath.Base(f.File) != "cg.go" {
+			t.Errorf("glue function %s in %s", f.Name, f.File)
+		}
+	}
+}
+
+// In a go.work workspace every module is "main" to the go command, but a
+// sibling the program imports is still a dependency.
+func TestWorkspaceSiblingIsADependency(t *testing.T) {
+	r, err := Analyze(Options{Dir: "testdata/ws/app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.MainModule != "example.com/wsapp" {
+		t.Fatalf("main module %q", r.MainModule)
+	}
+	lib := dep(t, r, "example.com/wslib")
+	if lib.ReachedFuncs != 1 || lib.Funcs != 2 {
+		t.Fatalf("wslib: reached %d of %d", lib.ReachedFuncs, lib.Funcs)
+	}
+}
+
+// Weighing someone else's code must not make the go command download and run
+// the toolchain their go.mod names.
+func TestNoToolchainDownloads(t *testing.T) {
+	t.Setenv("GOPROXY", "off")
+	t.Setenv("GOTOOLCHAIN", "")
+	if _, err := Analyze(Options{Dir: "testdata/pintool"}); err != nil {
+		t.Fatalf("a toolchain line should be ignored, not fetched: %v", err)
+	}
+	_, err := Analyze(Options{Dir: "testdata/newgo"})
+	if err == nil || strings.Contains(err.Error(), "downloading") || !strings.Contains(err.Error(), "-toolchain=auto") {
+		t.Fatalf("want a refusal that names -toolchain=auto, got %v", err)
+	}
+}
+
+func TestEnv(t *testing.T) {
+	t.Setenv("GOTOOLCHAIN", "")
+	has := func(env []string, kv string) bool { return slices.Contains(env, kv) }
+	if env := (Options{}).Env(); !has(env, "GOTOOLCHAIN=local") || has(env, "GOPROXY=off") || has(env, "CGO_ENABLED=0") {
+		t.Fatalf("default env: %v", env[len(env)-3:])
+	}
+	if env := (Options{Offline: true, NoCgo: true}).Env(); !has(env, "GOPROXY=off") || !has(env, "CGO_ENABLED=0") {
+		t.Fatal("offline/no-cgo not applied")
+	}
+	if env := (Options{AutoToolchain: true}).Env(); has(env, "GOTOOLCHAIN=local") {
+		t.Fatal("-toolchain=auto still pins local")
 	}
 }

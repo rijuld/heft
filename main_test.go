@@ -335,6 +335,7 @@ func TestBaseDiff(t *testing.T) {
 func TestMCP(t *testing.T) {
 	abs, _ := filepath.Abs(app)
 	argsJSON, _ := json.Marshal(map[string]any{"module": "tiny", "dir": abs})
+	probe := filepath.Join(t.TempDir(), "probe.tar")
 	stdin = strings.NewReader(strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`,
 		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
@@ -343,6 +344,10 @@ func TestMCP(t *testing.T) {
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"heft_why","arguments":{"module":"nope","dir":` + strconv.Quote(abs) + `}}}`,
 		`{"jsonrpc":"2.0","id":5,"method":"bogus"}`,
 		`{"jsonrpc":"2.0","id":6,"method":"ping"}`,
+		// Agent-supplied strings must never reach go or git as flags.
+		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"heft_try","arguments":{"module":"-modfile=x.mod@v1","dir":` + strconv.Quote(abs) + `}}}`,
+		`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"heft_diff","arguments":{"base":` + strconv.Quote("--output="+probe) + `,"dir":` + strconv.Quote(abs) + `}}}`,
+		`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"heft_try","arguments":{"module":"../big","use":["-toolexec=x/y.F"],"dir":` + strconv.Quote(abs) + `}}}`,
 	}, "\n") + "\n")
 	defer func() { stdin = os.Stdin }()
 
@@ -351,8 +356,8 @@ func TestMCP(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, errs)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 6 {
-		t.Fatalf("want 6 responses (none for the notification), got %d:\n%s", len(lines), out)
+	if len(lines) != 9 {
+		t.Fatalf("want 9 responses (none for the notification), got %d:\n%s", len(lines), out)
 	}
 	type resp struct {
 		ID     int `json:"id"`
@@ -391,6 +396,15 @@ func TestMCP(t *testing.T) {
 	}
 	if rs[5].ID != 6 || rs[5].Error != nil {
 		t.Errorf("ping: %+v", rs[5])
+	}
+	for _, r := range rs[6:] {
+		text := r.Result.Content[0].Text
+		if !r.Result.IsError || !strings.Contains(text, "invalid") && !strings.Contains(text, "not a commit") {
+			t.Errorf("id %d: want the argument refused before it reaches go or git, got: %s", r.ID, text)
+		}
+	}
+	if _, err := os.Stat(probe); err == nil {
+		t.Error("git wrote the file an agent named in -base")
 	}
 }
 

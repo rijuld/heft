@@ -24,6 +24,10 @@ what heft does about it.
 `heft try` downloads the module you name, in a temporary directory; it never edits your
 `go.mod` or `go.sum`.
 
+`heft mcp` serves the same tools to agents. A tool call can't loosen these
+defaults, and module paths, package paths and git refs that would reach the `go` or
+`git` command as a flag are refused.
+
 For the strictest run on untrusted code: `heft -offline -cgo=false`, inside a container
 or VM if you're being thorough.
 

@@ -108,9 +108,16 @@ func AnalyzeAt(ref string, opt Options) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := git("rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
+	// The ref may come from an agent over MCP: never let git read it as an
+	// option, and hand git archive only the commit it resolves to.
+	if strings.HasPrefix(ref, "-") {
 		return nil, fmt.Errorf("-base %q: not a commit in this repository", ref)
 	}
+	sha, err := git("rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
+	if err != nil {
+		return nil, fmt.Errorf("-base %q: not a commit in this repository", ref)
+	}
+	commit := strings.TrimSpace(string(sha))
 
 	tmp, err := os.MkdirTemp("", "heft-base-")
 	if err != nil {
@@ -118,7 +125,7 @@ func AnalyzeAt(ref string, opt Options) (*Report, error) {
 	}
 	defer os.RemoveAll(tmp)
 
-	cmd := exec.Command("git", "archive", "--format=tar", ref)
+	cmd := exec.Command("git", "archive", "--format=tar", commit)
 	cmd.Dir = strings.TrimSpace(string(top))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

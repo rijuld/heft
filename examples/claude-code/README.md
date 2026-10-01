@@ -7,7 +7,8 @@ of the module the program actually reaches, and what it drags in.
 ## 1. Give Claude the tools (MCP)
 
 ```sh
-go install github.com/rijuld/heft@latest   # pin a version once one is tagged
+git clone https://github.com/rijuld/heft && cd heft && go install .
+# once a release is tagged, pin it instead:  go install github.com/rijuld/heft@vX.Y.Z
 claude mcp add heft -- heft mcp
 ```
 

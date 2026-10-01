@@ -82,10 +82,10 @@ func Try(module string, use []string, opt Options) (*TryResult, error) {
 		if err := gocmd("mod", "edit", "-replace="+modPath+"="+dir); err != nil {
 			return nil, err
 		}
-		if err := gocmd("get", modPath+"@v0.0.0"); err != nil {
+		if err := gocmd("get", "--", modPath+"@v0.0.0"); err != nil {
 			return nil, err
 		}
-	} else if err := gocmd("get", query); err != nil {
+	} else if err := gocmd("get", "--", query); err != nil {
 		return nil, err
 	}
 
@@ -183,8 +183,8 @@ func resolveTarget(arg, base string) (modPath, query string, err error) {
 	looksLocal := strings.HasPrefix(arg, ".") || filepath.IsAbs(arg)
 	if b, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil && looksLocal {
 		path := modulePath(b)
-		if path == "" {
-			return "", "", fmt.Errorf("%s/go.mod has no module line", arg)
+		if err := checkPath(path); err != nil {
+			return "", "", fmt.Errorf("%s/go.mod: %w", arg, err)
 		}
 		abs, err := filepath.Abs(dir)
 		if err != nil {
@@ -196,10 +196,31 @@ func resolveTarget(arg, base string) (modPath, query string, err error) {
 		return "", "", fmt.Errorf("%s: no go.mod there", arg)
 	}
 	path, _, _ := strings.Cut(arg, "@")
+	if err := checkPath(arg); err != nil {
+		return "", "", err
+	}
 	if !strings.Contains(arg, "@") {
 		arg += "@latest"
 	}
 	return path, arg, nil
+}
+
+// checkPath rejects strings that the go command would read as a flag, or
+// that can't be a module path or query. Arguments can come from an agent
+// over MCP, so this is a boundary.
+func checkPath(s string) error {
+	if s == "" {
+		return errors.New("empty module path")
+	}
+	if strings.HasPrefix(s, "-") {
+		return fmt.Errorf("invalid module path %q: starts with -", s)
+	}
+	for _, r := range s {
+		if r <= ' ' || r == 0x7f {
+			return fmt.Errorf("invalid module path %q", s)
+		}
+	}
+	return nil
 }
 
 // modulePath returns the module line of a go.mod file. (x/mod/modfile does
@@ -240,6 +261,9 @@ func useTargets(modPath string, use []string) (map[string][]useTarget, error) {
 				return nil, fmt.Errorf("-use %q: want pkg.Func", u)
 			}
 			pkg, name = u[:i+1+dot], rest[dot+1:]
+			if err := checkPath(pkg); err != nil {
+				return nil, fmt.Errorf("-use %q: %w", u, err)
+			}
 		} else if parts := strings.Split(u, "."); len(parts) == 3 || (len(parts) == 2 && isLower(parts[0])) {
 			// semver.Compare or semver.Version.String: a package element.
 			pkg, name = shortPrefix+parts[0], strings.Join(parts[1:], ".")
@@ -543,6 +567,7 @@ func buildModules(opt Options) (map[string]bool, error) {
 	if opt.Tags != "" {
 		args = append(args, "-tags="+opt.Tags)
 	}
+	args = append(args, "--")
 	cmd := exec.Command("go", append(args, patterns...)...)
 	cmd.Dir, cmd.Env = opt.Dir, opt.Env()
 	out, err := cmd.Output()

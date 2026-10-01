@@ -9,8 +9,10 @@ it was reasoned from the code but not exercised.
 
 ## Status
 
-Addressed on the `fix/review-findings` branch. Every fix has a test that fails
-without it; CI passes on Linux, macOS and Windows, plus govulncheck.
+Addressed on the `fix/review-findings` branch. The correctness fixes (§2.1–2.3) and
+the MCP argument checks have tests confirmed to fail on the old code; the CLI and
+security changes are covered by new tests. CI passes on Linux, macOS and Windows,
+plus govulncheck.
 
 | § | Item | Status |
 | --- | --- | --- |
@@ -38,6 +40,7 @@ without it; CI passes on Linux, macOS and Windows, plus govulncheck.
 | 3.5 | CI hygiene | ✅ Fixed: explicit `permissions`, SHA-pinned actions, no persisted credentials, Windows, govulncheck. govulncheck found stdlib vulnerabilities reachable from heft under Go 1.26.0, so CI and releases now use patched Go. |
 | 3.6 | Distribution | ✅ GoReleaser + provenance workflow, run on tag push. README no longer recommends `@latest` in CI. **No tag has been pushed yet.** |
 | 3.7 | SECURITY.md | ✅ Added |
+| new | Agent-supplied MCP arguments reaching `go`/`git` as flags | ✅ Found while fixing (`heft_try` with `module: "-modfile=…"` reached `go get` as a flag), fixed and tested: paths and refs starting with `-` are refused, `--`/`--end-of-options` everywhere, `git archive` gets only the resolved commit SHA |
 | 4 | Memory | 📝 Documented. Reducing it is deferred. |
 | 4 | Progress / `-v` | ✅ Fixed |
 | 4 | `-sort` | ✅ Fixed |

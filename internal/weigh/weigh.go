@@ -30,6 +30,30 @@ type Options struct {
 	Dir      string   // working directory (default: current)
 	Patterns []string // package patterns (default: ./...)
 	Tags     string   // comma-separated build tags
+
+	// heft is often pointed at code you don't control, so by default the go
+	// command may not switch to the toolchain the target's go.mod asks for.
+	AutoToolchain bool // allow GOTOOLCHAIN downloads (default: GOTOOLCHAIN=local)
+	Offline       bool // GOPROXY=off: never download modules
+	NoCgo         bool // CGO_ENABLED=0: never run the C toolchain
+}
+
+// Env returns the environment heft runs the go command with.
+func (opt Options) Env() []string {
+	env := os.Environ()
+	if !opt.AutoToolchain && os.Getenv("GOTOOLCHAIN") == "" {
+		env = append(env, "GOTOOLCHAIN=local")
+	}
+	if opt.AutoToolchain {
+		env = append(env, "GOTOOLCHAIN=auto")
+	}
+	if opt.Offline {
+		env = append(env, "GOPROXY=off")
+	}
+	if opt.NoCgo {
+		env = append(env, "CGO_ENABLED=0")
+	}
+	return env
 }
 
 // Func is one source-level function or method declaration.
@@ -128,13 +152,14 @@ func Analyze(opt Options) (*Report, error) {
 	cfg := &packages.Config{
 		Mode: packages.LoadAllSyntax | packages.NeedModule,
 		Dir:  opt.Dir,
+		Env:  opt.Env(),
 	}
 	if opt.Tags != "" {
 		cfg.BuildFlags = []string{"-tags=" + opt.Tags}
 	}
 	initial, err := packages.Load(cfg, patterns...)
 	if err != nil {
-		return nil, err
+		return nil, explain(err)
 	}
 	var loadErrs []string
 	packages.Visit(initial, nil, func(p *packages.Package) {
@@ -146,7 +171,7 @@ func Analyze(opt Options) (*Report, error) {
 		if len(loadErrs) > 10 {
 			loadErrs = append(loadErrs[:10], fmt.Sprintf("... and %d more", len(loadErrs)-10))
 		}
-		return nil, fmt.Errorf("packages have errors:\n  %s", strings.Join(loadErrs, "\n  "))
+		return nil, explain(fmt.Errorf("packages have errors:\n  %s", strings.Join(loadErrs, "\n  ")))
 	}
 
 	prog, ssaPkgs := ssautil.AllPackages(initial, ssa.InstantiateGenerics)
@@ -375,6 +400,14 @@ func Analyze(opt Options) (*Report, error) {
 		return pkgModule[fn.Pkg.Pkg.Path()], fn.Pkg.Pkg.Path()
 	}
 	return r, nil
+}
+
+// explain adds the way out to errors caused by heft's safe defaults.
+func explain(err error) error {
+	if strings.Contains(err.Error(), "GOTOOLCHAIN=local") {
+		return fmt.Errorf("%w\n(heft does not download Go toolchains by default; install that Go version, or rerun with -toolchain=auto)", err)
+	}
+	return err
 }
 
 // span counts the source lines from start to end. //line directives (in

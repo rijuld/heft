@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -229,5 +230,33 @@ func TestWorkspaceSiblingIsADependency(t *testing.T) {
 	lib := dep(t, r, "example.com/wslib")
 	if lib.ReachedFuncs != 1 || lib.Funcs != 2 {
 		t.Fatalf("wslib: reached %d of %d", lib.ReachedFuncs, lib.Funcs)
+	}
+}
+
+// Weighing someone else's code must not make the go command download and run
+// the toolchain their go.mod names.
+func TestNoToolchainDownloads(t *testing.T) {
+	t.Setenv("GOPROXY", "off")
+	t.Setenv("GOTOOLCHAIN", "")
+	if _, err := Analyze(Options{Dir: "testdata/pintool"}); err != nil {
+		t.Fatalf("a toolchain line should be ignored, not fetched: %v", err)
+	}
+	_, err := Analyze(Options{Dir: "testdata/newgo"})
+	if err == nil || strings.Contains(err.Error(), "downloading") || !strings.Contains(err.Error(), "-toolchain=auto") {
+		t.Fatalf("want a refusal that names -toolchain=auto, got %v", err)
+	}
+}
+
+func TestEnv(t *testing.T) {
+	t.Setenv("GOTOOLCHAIN", "")
+	has := func(env []string, kv string) bool { return slices.Contains(env, kv) }
+	if env := (Options{}).Env(); !has(env, "GOTOOLCHAIN=local") || has(env, "GOPROXY=off") || has(env, "CGO_ENABLED=0") {
+		t.Fatalf("default env: %v", env[len(env)-3:])
+	}
+	if env := (Options{Offline: true, NoCgo: true}).Env(); !has(env, "GOPROXY=off") || !has(env, "CGO_ENABLED=0") {
+		t.Fatal("offline/no-cgo not applied")
+	}
+	if env := (Options{AutoToolchain: true}).Env(); has(env, "GOTOOLCHAIN=local") {
+		t.Fatal("-toolchain=auto still pins local")
 	}
 }
